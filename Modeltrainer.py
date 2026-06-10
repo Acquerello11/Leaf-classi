@@ -4,7 +4,7 @@ import numpy as np
 import pickle
 from PIL import Image
 import torchvision.transforms as transforms
-from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.svm import SVC
 from collections import Counter
 
 class RobustPlantPredictor:
@@ -22,20 +22,22 @@ class RobustPlantPredictor:
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
         
-        self.folder_centroids = {}
-        self.class_counts = Counter()
+        self.classifier = None
         
         if os.path.exists(self.index_file):
-            print(f"✅ พบไฟล์ {self.index_file} กำลังโหลดฐานข้อมูลพิกัด...")
+            print(f"✅ พบไฟล์ {self.index_file} กำลังโหลดฐานข้อมูลโมเดล SVM...")
             with open(self.index_file, 'rb') as f:
                 data = pickle.load(f)
-                self.folder_centroids = data['centroids']
-                self.class_counts = data['counts']
-            print(f"✅ โหลดข้อมูลสำเร็จ! พร้อมใช้งานสำหรับ {len(self.folder_centroids)} คลาส")
+                self.classifier = data.get('classifier')
+            if self.classifier is not None:
+                print(f"✅ โหลดข้อมูลสำเร็จ! พร้อมใช้งานสำหรับ {len(self.classifier.classes_)} คลาส")
 
-    def _get_embedding(self, img_path):
+    def _get_embedding(self, img_input):
         try:
-            img = Image.open(img_path).convert('RGB')
+            if isinstance(img_input, str):
+                img = Image.open(img_input).convert('RGB')
+            else:
+                img = img_input.convert('RGB')
             tensor = self.transform(img).unsqueeze(0).to(self.device)
             with torch.no_grad():
                 embedding = self.encoder(tensor).flatten().cpu().numpy()
@@ -44,63 +46,58 @@ class RobustPlantPredictor:
             return None
 
     def build_index(self, train_dir_path):
-        """ สแกนโฟลเดอร์เพื่อคำนวณ Centroid (ไม่ต้องลบภาพขยะแล้ว เพราะทำมาก่อนหน้านี้แล้ว) """
-        if self.folder_centroids:
-            print("ข้อมูล Centroid ถูกโหลดเรียบร้อยแล้ว ข้ามขั้นตอนการสร้างใหม่เพื่อประหยัดเวลา...")
-            return
-
+        """ สแกนโฟลเดอร์เพื่อสกัด Features และสอนโมเดล SVM """
+        # We don't skip here if we want to force retrain, but let's keep the check
+        # Actually, let's remove the skip if we want to retrain because the old file might just have centroids.
+        # It's better to force a retrain if we are calling this.
+        
         valid_folders = [f for f in sorted(os.listdir(train_dir_path)) if os.path.isdir(os.path.join(train_dir_path, f))]
         total_folders = len(valid_folders)
         
-        print(f"🚀 เริ่มต้นหาจุดกึ่งกลาง (Centroid) ทั้งหมด {total_folders} คลาส ใน {train_dir_path}...")
+        print(f"🚀 เริ่มต้นสกัดจุดเด่น (Features) ทั้งหมด {total_folders} คลาส ใน {train_dir_path}...")
+        
+        X = []
+        y = []
         
         for idx, folder_name in enumerate(valid_folders, 1):
             folder_path = os.path.join(train_dir_path, folder_name)
             
-            # ปริ้นท์บอกก่อนเริ่มสแกนโฟลเดอร์นั้นๆ
             print(f"⏳ [{idx}/{total_folders}] กำลังสกัดจุดเด่นคลาส: {folder_name} ... ", end="", flush=True)
             
-            raw_embeddings = []
+            count = 0
             for img_name in os.listdir(folder_path):
                 img_path = os.path.join(folder_path, img_name)
                 emb = self._get_embedding(img_path)
                 if emb is not None:
-                    raw_embeddings.append(emb)
+                    X.append(emb)
+                    y.append(folder_name)
+                    count += 1
             
-            if not raw_embeddings:
+            if count == 0:
                 print("❌ ข้าม (ไม่มีรูปภาพอ่านได้)")
-                continue
-                
-            raw_embeddings = np.array(raw_embeddings)
+            else:
+                print(f"✅ เสร็จสิ้น ({count} รูป)")
             
-            # ข้อมูลสะอาดอยู่แล้ว ใช้ Mean หรือ Median ได้เลยตรงๆ
-            self.folder_centroids[folder_name] = np.median(raw_embeddings, axis=0)
-            self.class_counts[folder_name] = len(raw_embeddings)
-            
-            # ปริ้นท์บอกว่าเสร็จแล้ว
-            print(f"✅ เสร็จสิ้น ({len(raw_embeddings)} รูป)")
-            
-        print("✅ สร้างฐานข้อมูล Centroid สำเร็จ!")
+        print("✅ สกัด Features สำเร็จ! เริ่มฝึกสอนโมเดล SVM...")
+        self.classifier = SVC(kernel='linear', probability=True, class_weight='balanced')
+        self.classifier.fit(X, y)
+        print("✅ ฝึกสอนโมเดล SVM สำเร็จ!")
         
-        # เซฟลงไฟล์ .pkl จะได้ไม่ต้องทำใหม่คราวหน้า
         with open(self.index_file, 'wb') as f:
             pickle.dump({
-                'centroids': self.folder_centroids,
-                'counts': self.class_counts
+                'classifier': self.classifier
             }, f)
-        print(f"💾 บันทึกฐานข้อมูลลงในไฟล์ {self.index_file} เรียบร้อยแล้ว!")
+        print(f"💾 บันทึกโมเดลลงในไฟล์ {self.index_file} เรียบร้อยแล้ว!")
 
-    def predict(self, target_img_path, top_k=5):
-        target_emb = self._get_embedding(target_img_path)
-        if target_emb is None:
+    def predict(self, target_img_input, top_k=5):
+        target_emb = self._get_embedding(target_img_input)
+        if target_emb is None or self.classifier is None:
             return []
 
-        results = []
-        for folder_name, centroid_emb in self.folder_centroids.items():
-            sim = cosine_similarity(target_emb.reshape(1, -1), centroid_emb.reshape(1, -1))[0][0]
-            similarity_percentage = max(0.0, (sim + 1) / 2 * 100) 
-            results.append((folder_name, similarity_percentage))
-
+        probs = self.classifier.predict_proba(target_emb.reshape(1, -1))[0]
+        classes = self.classifier.classes_
+        
+        results = [(cls, prob * 100.0) for cls, prob in zip(classes, probs)]
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:top_k]
 

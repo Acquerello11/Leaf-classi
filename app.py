@@ -1,19 +1,18 @@
 import gradio as gr
 import os
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras.models import load_model
-from tensorflow.keras.utils import img_to_array
 from PIL import Image
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import io, base64
 
+# Import predictor
+from Modeltrainer import RobustPlantPredictor
+
 # Configuration
-MODEL_PATH = 'best_leaf_model_b1_finetuned.keras'
-TRAIN_DIR = 'processed_data/data/train'
-IMG_SIZE = (224, 224)
+MODEL_PATH = 'dino_centroids_cleaned.pkl'
+TRAIN_DIR = 'processed_data/data_cleaned/train'
 
 # 1. Load Class Names
 if os.path.exists(TRAIN_DIR):
@@ -22,32 +21,35 @@ else:
     class_names = [f"Class {i}" for i in range(61)]
 
 # 2. Load Model
-model = None
+predictor = None
 if os.path.exists(MODEL_PATH):
-    print("🧠 กำลังโหลดสมอง AI...")
+    print("🧠 กำลังโหลดสมอง AI (DINOv2 Centroid)...")
     try:
-        model = load_model(MODEL_PATH)
+        predictor = RobustPlantPredictor(MODEL_PATH)
         print("✅ โหลดสมอง AI สำเร็จ!")
     except Exception as e:
-        print(f"⚠️ ไฟล์ '{MODEL_PATH}' ยังสร้างไม่เสร็จสมบูรณ์")
-        model = None
+        print(f"⚠️ ไฟล์ '{MODEL_PATH}' มีปัญหา: {e}")
+        predictor = None
 else:
     print(f"⚠️ ยังไม่พบไฟล์ '{MODEL_PATH}'")
 
 # 3. Single prediction
 def predict_single(pil_img):
-    img = pil_img.resize(IMG_SIZE)
-    img_array = img_to_array(img)
-    img_array = np.expand_dims(img_array, axis=0)
-    predictions = model.predict(img_array, verbose=0)[0]
-    top_5_indices = predictions.argsort()[-5:][::-1]
-    top_class = class_names[top_5_indices[0]]
-    top5 = {class_names[i]: float(predictions[i]) for i in top_5_indices}
+    if predictor is None:
+        return "Unknown", {"Unknown": 1.0}
+    
+    predictions = predictor.predict(pil_img, top_k=5)
+    
+    if not predictions:
+        return "Unknown", {"Unknown": 1.0}
+        
+    top_class = predictions[0][0]
+    top5 = {folder: score / 100.0 for folder, score in predictions}
     return top_class, top5
 
 # 4. Multi-image prediction → cards HTML + store results
 def predict_multiple(files):
-    if model is None:
+    if predictor is None:
         return ("<div style='text-align:center;padding:40px;color:#c62828;'>❌ โมเดลยังไม่พร้อม</div>",
                 [], gr.update(visible=False))
     if not files:
@@ -72,18 +74,16 @@ def predict_multiple(files):
             thumb_b64 = base64.b64encode(buf.read()).decode('utf-8')
 
             bars = ""
-            first = True
-            for name, prob in top5.items():
+            for idx, (name, prob) in enumerate(top5.items(), 1):
                 pct = prob * 100
-                bar_color = "#2e7d32" if first else "#81c784"
-                wt = "bold" if first else "normal"
+                bar_color = "#2e7d32" if idx == 1 else "#81c784"
+                wt = "bold" if idx == 1 else "normal"
                 bars += f"""<div style="margin-bottom:5px;">
                   <div style="display:flex;justify-content:space-between;font-size:0.85em;font-weight:{wt};color:#333;">
-                    <span>{name}</span><span>{pct:.1f}%</span></div>
+                    <span>อันดับ {idx}: {name}</span><span>{pct:.1f}%</span></div>
                   <div style="background:#e8f5e9;border-radius:6px;overflow:hidden;height:10px;">
                     <div style="width:{pct}%;height:100%;background:{bar_color};border-radius:6px;"></div>
                   </div></div>"""
-                first = False
 
             top_prob = list(top5.values())[0] * 100
             cards_html += f"""
