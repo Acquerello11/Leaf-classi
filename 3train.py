@@ -7,6 +7,12 @@ from torchvision import transforms, models
 from tqdm import tqdm
 from PIL import Image
 import torch.backends.cudnn as cudnn
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report
+import numpy as np
 
 # เปิดโหมดรีดความเร็วสูงสุดของการ์ดจอ
 cudnn.benchmark = True
@@ -99,6 +105,9 @@ class MasterModelTrainer:
 
         best_acc = 0.0
         
+        # สำหรับเก็บประวัติการเทรน
+        history = {'train_loss': [], 'val_acc': []}
+        
         print(f"\nเริ่มเทรน Master Model (Linear Probe) บนอุปกรณ์: {self.device}")
         for epoch in range(epochs):
             # --- Training ---
@@ -120,6 +129,7 @@ class MasterModelTrainer:
                 running_loss += loss.item() * inputs.size(0)
                 
             epoch_loss = running_loss / len(train_dataset)
+            history['train_loss'].append(epoch_loss)
 
             # --- Validation ---
             model.eval()
@@ -133,6 +143,7 @@ class MasterModelTrainer:
                     corrects += torch.sum(preds == labels.data)
                     
             epoch_acc = float(corrects) / len(val_dataset) * 100
+            history['val_acc'].append(epoch_acc)
             
             print(f"Epoch {epoch+1}/{epochs} | Train Loss: {epoch_loss:.4f} | Val Accuracy: {epoch_acc:.2f}%")
             
@@ -140,6 +151,72 @@ class MasterModelTrainer:
                 best_acc = epoch_acc
                 torch.save(model.state_dict(), 'master_router_model.pth')
                 print("   --> บันทึกโมเดลนายประตูที่ดีที่สุดแล้ว!")
+                
+        # สร้างกราฟ Loss & Accuracy
+        self._plot_training_curves(history, epochs)
+        
+        # ประเมินผลและสร้าง Confusion Matrix หลังจากเทรนเสร็จ
+        self._evaluate_model(model, val_loader, train_dataset.group_names)
+
+    def _plot_training_curves(self, history, epochs):
+        plt.figure(figsize=(12, 5))
+        
+        plt.subplot(1, 2, 1)
+        plt.plot(range(1, epochs + 1), history['train_loss'], label='Train Loss', color='red', marker='o')
+        plt.title('Training Loss')
+        plt.xlabel('Epochs')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.grid(True)
+        
+        plt.subplot(1, 2, 2)
+        plt.plot(range(1, epochs + 1), history['val_acc'], label='Validation Accuracy', color='green', marker='o')
+        plt.title('Validation Accuracy')
+        plt.xlabel('Epochs')
+        plt.ylabel('Accuracy (%)')
+        plt.legend()
+        plt.grid(True)
+        
+        plt.tight_layout()
+        plt.savefig('master_training_curves.png', dpi=300)
+        plt.close()
+        print("✅ บันทึกกราฟการเทรน master_training_curves.png เรียบร้อยแล้ว")
+
+    def _evaluate_model(self, model, dataloader, class_names):
+        print("\nกำลังประเมินผล Master Model...")
+        model.load_state_dict(torch.load('master_router_model.pth'))
+        model.eval()
+        
+        all_preds = []
+        all_labels = []
+        
+        with torch.no_grad():
+            for inputs, labels in tqdm(dataloader, desc="Evaluating"):
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+                features = self.encoder(inputs)
+                outputs = model(features)
+                _, preds = torch.max(outputs, 1)
+                
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+                
+        # Classification Report
+        report = classification_report(all_labels, all_preds, target_names=class_names)
+        with open('master_classification_report.txt', 'w', encoding='utf-8') as f:
+            f.write(report)
+        print("✅ บันทึก master_classification_report.txt เรียบร้อยแล้ว")
+        
+        # Confusion Matrix
+        cm = confusion_matrix(all_labels, all_preds)
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+        plt.title("Master Router Confusion Matrix")
+        plt.ylabel("True Class")
+        plt.xlabel("Predicted Class")
+        plt.tight_layout()
+        plt.savefig('master_confusion_matrix.png', dpi=300)
+        plt.close()
+        print("✅ บันทึกกราฟ master_confusion_matrix.png เรียบร้อยแล้ว")
 
 if __name__ == "__main__":
     # ใส่พาธที่คุณเก็บโฟลเดอร์ hierarchical_splits เอาไว้

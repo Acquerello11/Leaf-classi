@@ -2,7 +2,7 @@ import os
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix, classification_report
-from sklearn.metrics import confusion_matrix, classification_report
+import pandas as pd
 import importlib.util
 from tqdm import tqdm
 
@@ -64,7 +64,7 @@ def evaluate_system(engine, test_dir):
                 correct_predictions += 1
         except Exception as e:
             print(f"เกิดข้อผิดพลาดกับภาพ {img_path}: {e}")
-                    predicted_labels.append("error")
+            predicted_labels.append("error")
 
     # สรุปผลความแม่นยำรวม (Overall Accuracy)
     overall_accuracy = (correct_predictions / total_images) * 100
@@ -73,7 +73,17 @@ def evaluate_system(engine, test_dir):
 
     # สร้างรายงานสถิติแยกตามคลาส (Precision, Recall, F1-Score)
     print("\n--- รายงานเชิงลึก (Classification Report) ---")
-    print(classification_report(true_labels, predicted_labels, target_names=all_class_names))
+    
+    # แบบ Text
+    report_text = classification_report(true_labels, predicted_labels, target_names=all_class_names)
+    print(report_text)
+    
+    # แบบ CSV
+    report_dict = classification_report(true_labels, predicted_labels, target_names=all_class_names, output_dict=True)
+    df_report = pd.DataFrame(report_dict).transpose()
+    csv_path = 'evaluation_report.csv'
+    df_report.to_csv(csv_path)
+    print(f"✅ บันทึกรายงานสถิติลงไฟล์ {csv_path} เรียบร้อยแล้ว (สามารถเปิดใน Excel ได้)")
 
     # สร้างกราฟ Confusion Matrix
     print("\nกำลังสร้างกราฟ Confusion Matrix...")

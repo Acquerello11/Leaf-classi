@@ -5,6 +5,12 @@ import torch.nn.functional as F
 from torchvision import transforms, models
 from PIL import Image
 import numpy as np
+import cv2
+try:
+    from pytorch_grad_cam import GradCAM
+    from pytorch_grad_cam.utils.image import show_cam_on_image
+except ImportError:
+    GradCAM = None
 
 # โหลดโครงสร้างเลเยอร์ ArcFace ให้ตรงกับตอนเทรน Expert
 class ArcMarginProduct(nn.Module):
@@ -92,17 +98,20 @@ class PlantInferenceEngine:
                 self.experts[group_name] = expert_model
                 print(f"[Engine] โหลดผู้เชี่ยวชาญประจำระบบ: expert_{group_name} สำเร็จ")
 
-    def predict(self, img_path, top_k=3):
+    def predict(self, img_path, top_k=3, get_heatmap=False):
         # แปลงรูปภาพต้นทางเป็น Tensor 2 ระดับ
-        img = Image.open(img_path).convert('RGB')
-        tensor_master = self.transform_master(img).unsqueeze(0).to(self.device)
-        tensor_expert = self.transform_expert(img).unsqueeze(0).to(self.device)
+        img_original = Image.open(img_path).convert('RGB')
+        tensor_master = self.transform_master(img_original).unsqueeze(0).to(self.device)
+        tensor_expert = self.transform_expert(img_original).unsqueeze(0).to(self.device)
+        
+        predicted_group_name = None
+        group_confidence = 0.0
+        final_results = [("Unknown", 0.0)]
+        heatmap_img = None
         
         with torch.no_grad():
             # ด่านที่ 1: ให้ Master Model ทายกลุ่มใหญ่ก่อน
-            # 1.1 สกัดเวกเตอร์ด้วย DINOv2 (ใช้ภาพ 224px)
             features = self.encoder(tensor_master)
-            # 1.2 ส่งเข้า Linear Probe
             master_logits = self.master_model(features)
             master_probs = F.softmax(master_logits, dim=1).cpu().numpy()[0]
             
@@ -110,14 +119,13 @@ class PlantInferenceEngine:
             predicted_group_name = self.group_names[predicted_group_idx]
             group_confidence = master_probs[predicted_group_idx]
             
-            # ด่านที่ 2: ส่งต่อให้ Expert Model เฉพาะทาง (ใช้ภาพ High-Res 448px)
+            # ด่านที่ 2: ส่งต่อให้ Expert Model เฉพาะทาง
             if predicted_group_name in self.experts:
                 expert_model = self.experts[predicted_group_name]
                 expert_logits = expert_model(tensor_expert)
                 expert_probs = F.softmax(expert_logits, dim=1).cpu().numpy()[0]
                 
                 # ด่านที่ 3: คำนวณความน่าจะเป็นสุทธิ (Ensemble Probability)
-                # P(Species) = P(Group) * P(Species | Group)
                 final_results = []
                 sub_classes = self.group_to_classes_map[predicted_group_name]
                 
@@ -127,9 +135,41 @@ class PlantInferenceEngine:
                     
                 # จัดอันดับเปอร์เซ็นต์ความคล้ายคลึงสูงสุด
                 final_results.sort(key=lambda x: x[1], reverse=True)
-                return predicted_group_name, group_confidence * 100, final_results[:top_k]
-            else:
-                return predicted_group_name, group_confidence * 100, [("Unknown", 0.0)]
+                final_results = final_results[:top_k]
+
+        # สร้าง Heatmap ถ้าร้องขอ
+        if get_heatmap and GradCAM is not None and predicted_group_name in self.experts:
+            expert_model = self.experts[predicted_group_name]
+            # Wrapper for GradCAM
+            class CAMWrapper(nn.Module):
+                def __init__(self, exp_net):
+                    super().__init__()
+                    self.exp_net = exp_net
+                def forward(self, x):
+                    feats = self.exp_net.backbone(x)
+                    cos = F.linear(F.normalize(feats), F.normalize(self.exp_net.arcface.weight))
+                    return cos
+
+            target_layers = [expert_model.backbone.layer4[-1]]
+            cam = GradCAM(model=CAMWrapper(expert_model), target_layers=target_layers)
+            
+            grayscale_cam = cam(input_tensor=tensor_expert, targets=None)
+            grayscale_cam = grayscale_cam[0, :]
+            
+            # แปลงภาพกลับให้อยู่ในโหมด RGB (Undo Normalize)
+            img_np = tensor_expert.squeeze(0).permute(1, 2, 0).cpu().numpy()
+            mean = np.array([0.485, 0.456, 0.406])
+            std = np.array([0.229, 0.224, 0.225])
+            img_np = std * img_np + mean
+            img_np = np.clip(img_np, 0, 1)
+            
+            visualization = show_cam_on_image(img_np, grayscale_cam, use_rgb=True)
+            heatmap_img = Image.fromarray(visualization)
+
+        if get_heatmap:
+            return predicted_group_name, group_confidence * 100, final_results, heatmap_img
+        else:
+            return predicted_group_name, group_confidence * 100, final_results
 
 if __name__ == "__main__":
     # เรียกใช้ระบบประมวลผลควบคู่กันทั้งหมด
