@@ -54,7 +54,7 @@
 ผู้เชี่ยวชาญ (Expert Model) จะฝึกสอนเฉพาะในกลุ่มพืชที่มีลักษณะหน้าตาคล้ายกันมากๆ โดยประยุกต์ใช้เทคนิค **Deep Metric Learning**, **High-Resolution Pipeline**, และ **Hard Example Mining** 
 
 **กลไกการทำงาน (Mechanism):**
-1. **High-Resolution Pipeline:** เพิ่มขนาดภาพที่ใช้ Train และ Validate ให้สูงระดับ **448x448 พิกเซล** ข้อมูลจะถูกดึงเข้า `ResNet50` เพื่อเก็บรักษารายละเอียดไมโครฟีเจอร์ เช่น รูปแบบเส้นใบ (Venation) 
+1. **High-Resolution Pipeline & SwinV2:** อัปเกรดสถาปัตยกรรมจาก CNN พื้นฐานมาเป็น **Swin Transformer V2 (`swinv2_base_window12_192`)** และเพิ่มขนาดภาพที่ใช้ Train เป็น **384x384 พิกเซล** เพื่อเก็บรักษารายละเอียดไมโครฟีเจอร์ระดับสูง (เช่น รูปแบบเส้นใบ Venation) ได้แม่นยำยิ่งขึ้น
 2. **ArcFace Loss Integration:** ใช้เลเยอร์คณิตศาสตร์ `ArcMarginProduct` (สวมทับที่ส่วนหัวของโมเดลแทน Linear ธรรมดา) เพื่อทำหน้าที่บีบให้ภาพในคลาสเดียวกันมีความแคบลง (Compactness) และขยาย Margin ผลักคลาสอื่นๆ ให้ห่างออกจากกันเมื่อวัดด้วย Cosine Distance
 3. **Hard Negative Mining:** ใช้ฟังก์ชัน **Focal Loss** (ด้วยค่า $\gamma = 2.0$) แทนที่ Cross Entropy ซึ่งจะไปลดน้ำหนักการเรียนรู้ของภาพที่ตอบถูกแล้ว และหันไปบีบเค้นทำโทษให้โมเดลเรียนรู้หนักๆ กับภาพลักษณะ "คู่เหมือน" หรือภาพที่โมเดลยังสับสน
 
@@ -66,7 +66,7 @@
 Inference Engine ออกแบบกลไกเลียนแบบระบบ Top-down Processing (มองภาพรวมก่อน แล้วเจาะหารายละเอียด) รองรับท่อข้อมูลแบบหลายความละเอียดภาพ (Dual-Resolution) ควบรวมความน่าจะเป็นด้วยกฎทฤษฎีความน่าจะเป็น (Ensemble Probability)
 
 **กลไกการทำงาน (Mechanism):**
-1. **Dual-Resolution Transform:** แบ่งท่อแปลงขนาดภาพ 2 ระดับ: ภาพขนาด 224px ถูกส่งให้นายประตู (DINOv2) และ 448px ส่งให้ผู้เชี่ยวชาญ (ResNet50)
+1. **Dual-Resolution Transform:** แบ่งท่อแปลงขนาดภาพ 2 ระดับ: ภาพขนาด 224px ถูกส่งให้นายประตู (DINOv2) และ 384px ส่งให้ผู้เชี่ยวชาญ (SwinV2)
 2. **Master Routing (ด่านที่ 1):** ภาพส่งเข้า DINOv2 Router เพื่อพยากรณ์ความน่าจะเป็นระดับกลุ่มหลัก (Group Probability) ด้วย Softmax
 3. **Expert Activation (ด่านที่ 2):** เมื่อทราบว่าโมเดลควรส่งภาพไปให้กลุ่มใด, เครื่องยนต์จะโหลด `ExpertNet` ประจำกลุ่มนั้น มาคำนวณระยะห่าง (Cosine Distance ผ่าน ArcFace Weight) แปลงกลับมาเป็นระดับสายพันธุ์ (Species Probability)
 4. **Ensemble Probability Computation:** คำนวณความน่าจะเป็นสุทธิด้วยสมการ $P(Species) = P(Group) \times P(Species | Group)$ เพื่อจัดอันดับความเป็นไปได้ของสายพันธุ์ที่แม่นยำที่สุด (Top-K)
@@ -83,6 +83,23 @@ Inference Engine ออกแบบกลไกเลียนแบบระบ
 2. **Metric Calculation & Automated Reporting:** วัดและรวบรวมค่าทางสถิติที่สำคัญ ได้แก่ Overall Accuracy พร้อมแจกแจง Classification Report สรุปค่า Precision, Recall, และ F1-Score ประจำแต่ละคลาสอย่างละเอียด โดยส่งออกเป็นไฟล์ `evaluation_report.csv` เพื่อให้นำไปทำตารางรายงานได้ทันที
 3. **Confusion Matrix & Training Curves:** พล็อตกราฟ **Confusion Matrix** (Heatmap) ที่รวมทั้ง 61 คลาสเข้าไว้ด้วยกัน และกราฟแสดงผลการเทรน (Loss & Accuracy) ของทุกโมเดล (ไฟล์ 3 และไฟล์ 4)
 4. **Explainable AI (Grad-CAM):** สร้างภาพ Heatmap จากโมเดล Expert (ไฟล์ 4) เพื่อแสดงให้เห็นว่าบริเวณใดของใบไม้ (เช่น เส้นใบ, ขอบใบ) ที่ AI ให้ความสำคัญในการตัดสินใจสายพันธุ์
+
+---
+
+## 7. สถาปัตยกรรมทางเลือกความละเอียดสูง (High-Resolution 512x512 Branch)
+**หลักการ (Principle):**
+เพื่อรองรับการใช้งานบนเซิร์ฟเวอร์ที่มีประสิทธิภาพสูง (High-End GPU) ระบบได้เตรียมกระบะทรายคู่ขนานไว้ในโฟลเดอร์ `version_512_experiment`
+**กลไกการทำงาน:**
+สลับโมเดลเป็น `swinv2_base_window16_256` และรับภาพขนาด 512x512 พิกเซล โดยมีการเชื่อมโยง Data Pathway กลับมายังโฟลเดอร์ฐานข้อมูลหลัก (`../processed_data`) เพื่อประหยัดพื้นที่จัดเก็บข้อมูล (No Data Duplication)
+
+---
+
+## 8. กลไกการเร่งความเร็วการเทรน (Training Speed Optimization)
+**หลักการ (Principle):**
+โมเดล SwinV2 มีขนาดใหญ่และใช้เวลาประมวลผลนาน ระบบจึงถูกฝังเทคนิคการเร่งความเร็วทางวิศวกรรมซอฟต์แวร์ลงไป
+**กลไกการทำงาน:**
+1. **Automatic Mixed Precision (AMP):** แทรก `torch.cuda.amp.GradScaler` เพื่อลดความละเอียดทศนิยมลงเหลือ 16-bit อัตโนมัติ (FP16) ในเลเยอร์ที่ไม่ต้องการความแม่นยำสูง ช่วยเร่งความเร็ว 1.5-2 เท่าและลดการกิน VRAM ลง 50%
+2. **Epoch Scaling:** ลดจำนวนรอบลงตามความเหมาะสมของ Pre-clustered Data โดยไม่สูญเสียความแม่นยำ
 
 ---
 

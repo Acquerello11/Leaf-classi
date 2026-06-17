@@ -18,6 +18,7 @@ import numpy as np
 import cv2
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
+import timm
 
 cudnn.benchmark = True
 
@@ -60,10 +61,9 @@ class FocalLoss(nn.Module):
 class ExpertNet(nn.Module):
     def __init__(self, num_classes):
         super(ExpertNet, self).__init__()
-        # ใช้ ConvNeXt หรือ ResNet50 เป็นฐานสกัด Features
-        self.backbone = models.resnet50(pretrained=True)
-        in_features = self.backbone.fc.in_features
-        self.backbone.fc = nn.Identity() # ตัดหัวจำแนกแบบเก่าทิ้ง
+        # ใช้ Swin Transformer V2 เป็นฐานสกัด Features สำหรับ Fine-Grained (ปรับลดขนาดเป็น 384x384 เพื่อหลีกเลี่ยง Size Mismatch)
+        self.backbone = timm.create_model('swinv2_base_window12_192', pretrained=True, num_classes=0, img_size=384)
+        in_features = self.backbone.num_features
         
         # ใส่หัว ArcFace เข้าไปแทนที่
         self.arcface = ArcMarginProduct(in_features, num_classes, s=30.0, m=0.5)
@@ -82,7 +82,7 @@ class SpecializedExpertTrainer:
         
         # Data Augmentation แบบจัดเต็ม รองรับ High-Resolution
         self.train_transform = transforms.Compose([
-            transforms.RandomResizedCrop(448, scale=(0.5, 1.0)),
+            transforms.RandomResizedCrop(384, scale=(0.5, 1.0)),
             transforms.RandomRotation(15),
             transforms.ColorJitter(brightness=0.3, contrast=0.3),
             transforms.RandomHorizontalFlip(),
@@ -91,8 +91,8 @@ class SpecializedExpertTrainer:
         ])
         
         self.val_transform = transforms.Compose([
-            transforms.Resize(512),
-            transforms.CenterCrop(448),
+            transforms.Resize(448),
+            transforms.CenterCrop(384),
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
@@ -105,8 +105,9 @@ class SpecializedExpertTrainer:
         print(f"[{os.path.basename(target_group_path)}] ตรวจพบพืชย่อยในกลุ่มนี้: {self.num_classes} คลาส")
 
     def train(self, model_save_name, epochs=30):
-        train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4)
-        val_loader = DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4)
+        # ปรับลด num_workers ลงเพื่อป้องกันอาการค้างบน Windows (คอขวด CPU Multiprocessing)
+        train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+        val_loader = DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
         model = ExpertNet(num_classes=self.num_classes).to(self.device)
         # เปลี่ยนจาก CrossEntropy เป็น FocalLoss สำหรับ Hard Negative Mining
@@ -117,6 +118,9 @@ class SpecializedExpertTrainer:
         best_acc = 0.0
         history = {'train_loss': [], 'val_acc': []}
         
+        # เปิดระบบ AMP (Automatic Mixed Precision) เพื่อเร่งความเร็วการ์ดจอ
+        scaler = torch.amp.GradScaler('cuda')
+        
         for epoch in range(epochs):
             model.train()
             running_loss = 0.0
@@ -124,12 +128,15 @@ class SpecializedExpertTrainer:
                 inputs, labels = inputs.to(self.device), labels.to(self.device)
                 optimizer.zero_grad()
                 
-                # ส่ง Labels เข้าไปให้ ArcFace คำนวณ Margin
-                outputs = model(inputs, labels) 
-                loss = criterion(outputs, labels)
+                # เร่งสปีดด้วยการลดทศนิยมเหลือ 16-bit อัตโนมัติเฉพาะจุดที่ไม่ต้องการความแม่นยำสูง
+                with torch.amp.autocast('cuda'):
+                    outputs = model(inputs, labels) 
+                    loss = criterion(outputs, labels)
                 
-                loss.backward()
-                optimizer.step()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                
                 running_loss += loss.item() * inputs.size(0)
                 
             scheduler.step()
@@ -231,8 +238,8 @@ class SpecializedExpertTrainer:
         model.load_state_dict(torch.load(f"{save_name}.pth"))
         model.eval()
         
-        # Target layer for ResNet50 is usually the last basic block
-        target_layers = [model.backbone.layer4[-1]]
+        # Target layer for timm Swin Transformer is the last block
+        target_layers = [model.backbone.layers[-1].blocks[-1]]
         
         # We need a wrapper to compute the output from the backbone since arcface expects labels during train
         class CAMWrapper(nn.Module):
@@ -244,7 +251,12 @@ class SpecializedExpertTrainer:
                 cosine = F.linear(F.normalize(features), F.normalize(self.expert_net.arcface.weight))
                 return cosine
 
-        cam = GradCAM(model=CAMWrapper(model), target_layers=target_layers)
+        def reshape_transform(tensor):
+            # timm swin outputs [B, H, W, C] but GradCAM expects [B, C, H, W]
+            result = tensor.permute(0, 3, 1, 2)
+            return result
+
+        cam = GradCAM(model=CAMWrapper(model), target_layers=target_layers, reshape_transform=reshape_transform)
         
         # สุ่มรูปภาพ 1 รูปจาก validation set
         if len(dataset) == 0: return
@@ -296,7 +308,11 @@ if __name__ == "__main__":
             TARGET_GROUP = os.path.join(BASE_DIR, group_name)
             SAVE_NAME = f"expert_{group_name}"
             
-            # สร้างและรัน (แนะนำเทรน 30-50 Epochs เพราะคลาสหน้าตาเหมือนกัน ต้องใช้เวลาหาจุดต่าง)
-            # เราใช้ 30 Epochs เป็นมาตรฐานตามที่ตกลงกันไว้
-            trainer = SpecializedExpertTrainer(target_group_path=TARGET_GROUP, batch_size=16)
-            trainer.train(model_save_name=SAVE_NAME, epochs=30)
+            # ระบบ Auto-Resume: ข้ามกลุ่มที่เทรนเสร็จแล้วไปเลย
+            if os.path.exists(f"{SAVE_NAME}.pth"):
+                print(f"⏩ ตรวจพบโมเดล {SAVE_NAME}.pth แล้ว ระบบจะข้ามไปกลุ่มถัดไปอัตโนมัติ!")
+                continue
+            
+            # ปรับลดจาก 30 เหลือ 15 Epoch เพื่อความรวดเร็วร่วมกับระบบ AMP
+            trainer = SpecializedExpertTrainer(target_group_path=TARGET_GROUP, batch_size=8) # ⚠️ บังคับลด Batch Size เป็น 8 ห้ามปรับเป็น 16 เด็ดขาด! ป้องกันอาการค้าง
+            trainer.train(model_save_name=SAVE_NAME, epochs=15)

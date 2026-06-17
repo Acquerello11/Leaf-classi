@@ -1,0 +1,27 @@
+                precision    recall  f1-score   support
+
+ super_group_0       0.88      0.92      0.90       302
+ super_group_1       0.88      0.88      0.88       104
+super_group_10       0.78      0.81      0.79       192
+super_group_11       0.98      0.97      0.98       108
+super_group_12       0.98      0.96      0.97       128
+super_group_13       0.95      1.00      0.97        37
+super_group_14       0.87      0.95      0.91       147
+super_group_15       0.94      0.80      0.87       145
+super_group_16       0.93      0.92      0.93       324
+super_group_17       0.71      0.65      0.68       105
+super_group_18       0.94      0.74      0.83        66
+super_group_19       0.96      0.93      0.94        80
+ super_group_2       0.95      1.00      0.98        79
+super_group_20       1.00      0.68      0.81       114
+ super_group_3       0.98      0.97      0.97        97
+ super_group_4       0.99      0.99      0.99       121
+ super_group_5       0.77      0.91      0.84       269
+ super_group_6       0.99      0.99      0.99       201
+ super_group_7       0.94      0.98      0.96       170
+ super_group_8       0.98      0.97      0.97        96
+ super_group_9       1.00      0.99      1.00       151
+
+      accuracy                           0.91      3036
+     macro avg       0.92      0.90      0.91      3036
+  weighted avg       0.91      0.91      0.91      3036

@@ -3,8 +3,7 @@ import sys
 
 # เรียงลำดับไฟล์ที่ต้องรันต่อกัน
 scripts = [
-    "1prepare.py",
-    "2split.py",
+    "1_prepare_and_split.py",
     "3train.py",
     "4trainexpert.py",
     "6evaluate.py"

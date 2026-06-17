@@ -7,44 +7,67 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import io, base64
 
-# Import predictor
-from Modeltrainer import RobustPlantPredictor
+# Import predictor via importlib because filename starts with a number
+import importlib.util
+spec = importlib.util.spec_from_file_location("mixmodel", "5mixmodel.py")
+mixmodel = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mixmodel)
+PlantInferenceEngine = mixmodel.PlantInferenceEngine
 
 # Configuration
-MODEL_PATH = 'dino_centroids_cleaned.pkl'
 TRAIN_DIR = 'processed_data/data_cleaned/train'
+HIERARCHICAL_DIR = 'processed_data/hierarchical_splits'
 
 # 1. Load Class Names
-if os.path.exists(TRAIN_DIR):
-    class_names = sorted([d for d in os.listdir(TRAIN_DIR) if os.path.isdir(os.path.join(TRAIN_DIR, d))])
-else:
+class_names = []
+if os.path.exists(HIERARCHICAL_DIR):
+    for group in os.listdir(HIERARCHICAL_DIR):
+        group_train = os.path.join(HIERARCHICAL_DIR, group, 'train')
+        if os.path.isdir(group_train):
+            class_names.extend(os.listdir(group_train))
+    class_names = sorted(list(set(class_names)))
+
+if not class_names:
     class_names = [f"Class {i}" for i in range(61)]
 
 # 2. Load Model
-predictor = None
-if os.path.exists(MODEL_PATH):
-    print("🧠 กำลังโหลดสมอง AI (DINOv2 Centroid)...")
-    try:
-        predictor = RobustPlantPredictor(MODEL_PATH)
-        print("✅ โหลดสมอง AI สำเร็จ!")
-    except Exception as e:
-        print(f"⚠️ ไฟล์ '{MODEL_PATH}' มีปัญหา: {e}")
-        predictor = None
-else:
-    print(f"⚠️ ยังไม่พบไฟล์ '{MODEL_PATH}'")
+print("🧠 กำลังโหลดสมอง AI (Hierarchical MoE)...")
+try:
+    predictor = PlantInferenceEngine(
+        hierarchical_splits_dir=HIERARCHICAL_DIR,
+        master_weights_path="master_router_model.pth",
+        expert_weights_dir="."
+    )
+    print("✅ โหลดสมอง AI สำเร็จ!")
+except Exception as e:
+    print(f"⚠️ เกิดปัญหาในการโหลดโมเดล: {e}")
+    predictor = None
 
 # 3. Single prediction
 def predict_single(pil_img):
     if predictor is None:
         return "Unknown", {"Unknown": 1.0}
     
-    predictions = predictor.predict(pil_img, top_k=5)
-    
-    if not predictions:
-        return "Unknown", {"Unknown": 1.0}
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        pil_img.save(tmp.name)
+        tmp_path = tmp.name
         
-    top_class = predictions[0][0]
-    top5 = {folder: score / 100.0 for folder, score in predictions}
+    try:
+        group, group_conf, predictions = predictor.predict(tmp_path, top_k=5)
+        
+        if not predictions:
+            return "Unknown", {"Unknown": 1.0}
+            
+        top_class = predictions[0][0]
+        top5 = {folder: score / 100.0 for folder, score in predictions}
+    except Exception as e:
+        print("Prediction Error:", e)
+        return "Error", {"Error": 1.0}
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+            
     return top_class, top5
 
 # 4. Multi-image prediction → cards HTML + store results

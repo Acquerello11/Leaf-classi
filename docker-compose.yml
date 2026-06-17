@@ -1,0 +1,20 @@
+services:
+  leaf-classifier:
+    build: .
+    container_name: leaf_ai_trainer
+    # ใช้ Volume Mount แมปโฟลเดอร์ปัจจุบันของเครื่องจริง เข้าไปที่ /app ของ Container
+    # ทำให้ทุกครั้งที่ AI เซฟไฟล์ .pth ไฟล์จะมาโผล่ที่เครื่องจริงทันที
+    volumes:
+      - ./:/app
+    # ตั้งค่าให้ Container มองเห็นและใช้งานการ์ดจอ (NVIDIA GPU) ได้
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # เปิดโหมด IPC host ป้องกันปัญหา Shared Memory เต็มเวลาใช้ DataLoader num_workers หลายคน
+    ipc: host
+    # เปิดโหมด Standby ทิ้งไว้ เพื่อให้เราใช้คำสั่งมุด (exec) เข้ามารันโค้ดเองได้อย่างอิสระ
+    command: tail -f /dev/null

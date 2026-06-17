@@ -6,6 +6,7 @@ from torchvision import transforms, models
 from PIL import Image
 import numpy as np
 import cv2
+import timm
 try:
     from pytorch_grad_cam import GradCAM
     from pytorch_grad_cam.utils.image import show_cam_on_image
@@ -21,9 +22,8 @@ class ArcMarginProduct(nn.Module):
 class ExpertNet(nn.Module):
     def __init__(self, num_classes):
         super(ExpertNet, self).__init__()
-        self.backbone = models.resnet50(pretrained=False)
-        in_features = self.backbone.fc.in_features
-        self.backbone.fc = nn.Identity()
+        self.backbone = timm.create_model('swinv2_base_window12_192', pretrained=False, num_classes=0, img_size=384)
+        in_features = self.backbone.num_features
         self.arcface = ArcMarginProduct(in_features, num_classes)
 
     def forward(self, x):
@@ -52,8 +52,8 @@ class PlantInferenceEngine:
         ])
         
         self.transform_expert = transforms.Compose([
-            transforms.Resize(512),
-            transforms.CenterCrop(448),
+            transforms.Resize(448),
+            transforms.CenterCrop(384),
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
@@ -150,8 +150,10 @@ class PlantInferenceEngine:
                     cos = F.linear(F.normalize(feats), F.normalize(self.exp_net.arcface.weight))
                     return cos
 
-            target_layers = [expert_model.backbone.layer4[-1]]
-            cam = GradCAM(model=CAMWrapper(expert_model), target_layers=target_layers)
+            target_layers = [expert_model.backbone.layers[-1].blocks[-1]]
+            def reshape_transform(tensor):
+                return tensor.permute(0, 3, 1, 2)
+            cam = GradCAM(model=CAMWrapper(expert_model), target_layers=target_layers, reshape_transform=reshape_transform)
             
             grayscale_cam = cam(input_tensor=tensor_expert, targets=None)
             grayscale_cam = grayscale_cam[0, :]
