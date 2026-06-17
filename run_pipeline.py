@@ -3,7 +3,7 @@ import sys
 
 # เรียงลำดับไฟล์ที่ต้องรันต่อกัน
 scripts = [
-    "1_2_prepare_and_split.py",
+    "1_2_gradio_cleaner.py",
     "3train.py",
     "4trainexpert.py",
     "6evaluate.py"

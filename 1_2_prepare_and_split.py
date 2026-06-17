@@ -50,29 +50,44 @@ class UnifiedDataProcessor:
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
-    def clean_and_crop_image(self, img_path, class_name, cleaned_dir, discarded_dir, threshold=0.5, min_area_ratio=0.02):
+    def clean_and_crop_batch(self, batch_items, cleaned_dir, discarded_dir, threshold=0.5, min_area_ratio=0.02):
         """
-        Loads an image, runs DINOv2 self-attention to detect leaf regions,
-        crops them, and saves to cleaned_dir. If no leaf is found, copies to discarded_dir.
+        Processes a batch of images:
+        batch_items is a list of tuples: (img_path, class_name)
         """
-        try:
-            img_org = Image.open(img_path).convert('RGB')
-            w_org, h_org = img_org.size
+        batch_tensors = []
+        valid_items = []
+        
+        for img_path, class_name in batch_items:
+            try:
+                img_org = Image.open(img_path).convert('RGB')
+                valid_items.append((img_path, class_name, img_org))
+                img_tensor = self.scan_transform(img_org)
+                batch_tensors.append(img_tensor)
+            except Exception as e:
+                try:
+                    discard_class_dir = os.path.join(discarded_dir, class_name)
+                    os.makedirs(discard_class_dir, exist_ok=True)
+                    shutil.copy2(img_path, os.path.join(discard_class_dir, os.path.basename(img_path)))
+                except:
+                    pass
+                    
+        if not batch_tensors:
+            return 0, 0
             
-            # Prepare image for DINOv2 (224x224) without CenterCrop to scan the whole image
-            img_tensor = self.scan_transform(img_org).unsqueeze(0).to(self.device)
+        batch_tensor = torch.stack(batch_tensors).to(self.device)
+        B_size = batch_tensor.shape[0]
+        
+        self.attn_input = None
+        with torch.no_grad():
+            _ = self.encoder(batch_tensor)
             
-            self.attn_input = None
-            with torch.no_grad():
-                # รัน forward pass เพื่อกระตุ้น hook
-                _ = self.encoder(img_tensor)
-                
             if self.attn_input is None:
                 raise RuntimeError("ไม่สามารถดึง Attention Input จาก DINOv2 hook ได้")
                 
-            # คำนวณ self-attention แบบแมนนวลจาก Q และ K เพื่อหลีกเลี่ยงข้อจำกัดของ xFormers/SDPA
             attn_module = self.encoder.blocks[-1].attn
-            qkv = attn_module.qkv(self.attn_input) # [1, 257, 384*3]
+            qkv = attn_module.qkv(self.attn_input)
+            
             B, N, C_three = qkv.shape
             C = C_three // 3
             num_heads = attn_module.num_heads
@@ -81,86 +96,85 @@ class UnifiedDataProcessor:
             qkv = qkv.reshape(B, N, 3, num_heads, head_dim)
             q, k, v = torch.unbind(qkv, 2)
             
-            q = q.transpose(1, 2) # [1, num_heads, 257, head_dim]
-            k = k.transpose(1, 2) # [1, num_heads, 257, head_dim]
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
             
-            # Compute attention matrix: [1, num_heads, 257, 257]
             scale = head_dim ** -0.5
             scores = (q @ k.transpose(-2, -1)) * scale
             attn = scores.softmax(dim=-1)
             
-            # cls_attn shape: [1, num_heads, 257, 257] -> ดึงเฉพาะ CLS token ไปหา patch tokens
-            cls_attn = attn[:, :, 0, 1:] # [1, num_heads, 256]
-            cls_attn = cls_attn.mean(dim=1).squeeze(0) # [256]
-                
-            heatmap = cls_attn.reshape(16, 16).cpu().numpy()
+            cls_attn = attn[:, :, 0, 1:]
+            cls_attn = cls_attn.mean(dim=1)
             
-            # Normalize heatmap to [0, 1]
-            heatmap_min = heatmap.min()
-            heatmap_max = heatmap.max()
-            if heatmap_max - heatmap_min > 1e-8:
-                heatmap = (heatmap - heatmap_min) / (heatmap_max - heatmap_min)
-            else:
-                heatmap = np.zeros_like(heatmap)
-                
-            # Resize heatmap to 512x512 for fast contour analysis
-            heatmap_resized = cv2.resize(heatmap, (512, 512), interpolation=cv2.INTER_CUBIC)
-            
-            # Threshold to get binary mask
-            mask = (heatmap_resized > threshold).astype(np.uint8) * 255
-            
-            # Find contours
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            valid_crops = 0
-            scale_x = w_org / 512.0
-            scale_y = h_org / 512.0
-            
-            for idx, cnt in enumerate(contours):
-                x_512, y_512, w_512, h_512 = cv2.boundingRect(cnt)
-                contour_area_512 = cv2.contourArea(cnt)
-                total_area_512 = 512 * 512
-                
-                # Check if this contour area is at least min_area_ratio of the 512x512 area
-                if w_512 > 10 and h_512 > 10 and (contour_area_512 / total_area_512 >= min_area_ratio):
-                    x_org = max(0, int(x_512 * scale_x))
-                    y_org = max(0, int(y_512 * scale_y))
-                    w_org_box = min(w_org - x_org, int(w_512 * scale_x))
-                    h_org_box = min(h_org - y_org, int(h_512 * scale_y))
-                    
-                    if w_org_box > 30 and h_org_box > 30:
-                        cropped_img = img_org.crop((x_org, y_org, x_org + w_org_box, y_org + h_org_box))
-                        
-                        # Pad to square to prevent distortion during subsequent resizing
-                        max_dim = max(w_org_box, h_org_box)
-                        padded_img = Image.new("RGB", (max_dim, max_dim), (255, 255, 255))
-                        padded_img.paste(cropped_img, ((max_dim - w_org_box) // 2, (max_dim - h_org_box) // 2))
-                        
-                        filename = os.path.splitext(os.path.basename(img_path))[0]
-                        save_name = f"{filename}_leaf_{idx}.jpg"
-                        save_class_dir = os.path.join(cleaned_dir, class_name)
-                        os.makedirs(save_class_dir, exist_ok=True)
-                        padded_img.save(os.path.join(save_class_dir, save_name), quality=95)
-                        valid_crops += 1
-                        
-            if valid_crops > 0:
-                return True
-            else:
-                # No valid leaf found, copy original to discarded directory
-                discard_class_dir = os.path.join(discarded_dir, class_name)
-                os.makedirs(discard_class_dir, exist_ok=True)
-                shutil.copy2(img_path, os.path.join(discard_class_dir, os.path.basename(img_path)))
-                return False
-                
-        except Exception as e:
-            print(f"Error processing {img_path}: {e}")
+        heatmaps = cls_attn.reshape(B_size, 16, 16).detach().cpu().numpy()
+        
+        total_cleaned = 0
+        total_discarded = 0
+        
+        for idx, (img_path, class_name, img_org) in enumerate(valid_items):
             try:
-                discard_class_dir = os.path.join(discarded_dir, class_name)
-                os.makedirs(discard_class_dir, exist_ok=True)
-                shutil.copy2(img_path, os.path.join(discard_class_dir, os.path.basename(img_path)))
-            except:
-                pass
-            return False
+                w_org, h_org = img_org.size
+                heatmap = heatmaps[idx]
+                
+                heatmap_min = heatmap.min()
+                heatmap_max = heatmap.max()
+                if heatmap_max - heatmap_min > 1e-8:
+                    heatmap = (heatmap - heatmap_min) / (heatmap_max - heatmap_min)
+                else:
+                    heatmap = np.zeros_like(heatmap)
+                    
+                heatmap_resized = cv2.resize(heatmap, (512, 512), interpolation=cv2.INTER_CUBIC)
+                mask = (heatmap_resized > threshold).astype(np.uint8) * 255
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                
+                valid_crops = 0
+                scale_x = w_org / 512.0
+                scale_y = h_org / 512.0
+                
+                for c_idx, cnt in enumerate(contours):
+                    x_512, y_512, w_512, h_512 = cv2.boundingRect(cnt)
+                    contour_area_512 = cv2.contourArea(cnt)
+                    total_area_512 = 512 * 512
+                    
+                    if w_512 > 10 and h_512 > 10 and (contour_area_512 / total_area_512 >= min_area_ratio):
+                        x_org = max(0, int(x_512 * scale_x))
+                        y_org = max(0, int(y_512 * scale_y))
+                        w_org_box = min(w_org - x_org, int(w_512 * scale_x))
+                        h_org_box = min(h_org - y_org, int(h_512 * scale_y))
+                        
+                        if w_org_box > 30 and h_org_box > 30:
+                            cropped_img = img_org.crop((x_org, y_org, x_org + w_org_box, y_org + h_org_box))
+                            
+                            max_dim = max(w_org_box, h_org_box)
+                            padded_img = Image.new("RGB", (max_dim, max_dim), (255, 255, 255))
+                            padded_img.paste(cropped_img, ((max_dim - w_org_box) // 2, (max_dim - h_org_box) // 2))
+                            
+                            filename = os.path.splitext(os.path.basename(img_path))[0]
+                            save_name = f"{filename}_leaf_{c_idx}.jpg"
+                            save_class_dir = os.path.join(cleaned_dir, class_name)
+                            os.makedirs(save_class_dir, exist_ok=True)
+                            padded_img.save(os.path.join(save_class_dir, save_name), quality=95)
+                            valid_crops += 1
+                            
+                if valid_crops > 0:
+                    total_cleaned += 1
+                else:
+                    discard_class_dir = os.path.join(discarded_dir, class_name)
+                    os.makedirs(discard_class_dir, exist_ok=True)
+                    shutil.copy2(img_path, os.path.join(discard_class_dir, os.path.basename(img_path)))
+                    total_discarded += 1
+                    
+            except Exception as e:
+                print(f"Error processing {img_path} in batch loop: {e}")
+                try:
+                    discard_class_dir = os.path.join(discarded_dir, class_name)
+                    os.makedirs(discard_class_dir, exist_ok=True)
+                    shutil.copy2(img_path, os.path.join(discard_class_dir, os.path.basename(img_path)))
+                except:
+                    pass
+                total_discarded += 1
+                
+        return total_cleaned, total_discarded
 
     def find_optimal_k(self, embeddings, min_k=12, max_k=25):
         print(f"\n[AI Analysis] กำลังคำนวณหาจำนวนกลุ่มย่อยที่เหมาะสมที่สุด (จาก {min_k} ถึง {max_k} กลุ่ม)...")
@@ -210,13 +224,16 @@ class UnifiedDataProcessor:
                     
         total_cleaned = 0
         total_discarded = 0
+        batch_size = 64
         
-        for img_path, class_name in tqdm(all_original_images, desc="วิเคราะห์และตีกรอบใบไม้"):
-            success = self.clean_and_crop_image(img_path, class_name, cleaned_dir, discarded_dir)
-            if success:
-                total_cleaned += 1
-            else:
-                total_discarded += 1
+        pbar = tqdm(total=len(all_original_images), desc="วิเคราะห์และตีกรอบใบไม้ (Batch)")
+        for i in range(0, len(all_original_images), batch_size):
+            batch_items = all_original_images[i:i+batch_size]
+            cleaned_count, discarded_count = self.clean_and_crop_batch(batch_items, cleaned_dir, discarded_dir)
+            total_cleaned += cleaned_count
+            total_discarded += discarded_count
+            pbar.update(len(batch_items))
+        pbar.close()
                 
         print(f"✅ ตีกรอบใบไม้สำเร็จ: บันทึกข้อมูลใบไม้ {total_cleaned} รูป | ย้ายไปโฟลเดอร์คัดออก {total_discarded} รูป")
         
